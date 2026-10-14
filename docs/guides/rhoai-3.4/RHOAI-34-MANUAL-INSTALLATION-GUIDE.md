@@ -1124,8 +1124,8 @@ OpenShift service-ca bundle:
 
 ```bash
 oc -n kuadrant-system set env deployment/authorino \
-  SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
-  REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt
+  SSL_CERT_FILE=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt \
+  REQUESTS_CA_BUNDLE=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
 ```
 
 ### 7B.5 Verify Authorino TLS

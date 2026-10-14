@@ -1176,15 +1176,41 @@ OpenShift service-ca bundle:
 
 ```bash
 oc -n kuadrant-system set env deployment/authorino \
-  SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
-  REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt
+  SSL_CERT_FILE=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt \
+  REQUESTS_CA_BUNDLE=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
 ```
+
+> **Important -- do not use the path printed in the RHOAI 3.5 product guide.**
+> The shipped guide says
+> `SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt`.
+> That file **does not exist** in the Authorino pod. Go's `crypto/x509` silently
+> ignores an unreadable `SSL_CERT_FILE` and falls back to the system trust store,
+> which does not include `openshift-service-serving-signer` -- so the misconfiguration
+> produces no error at all until a model call is made.
+>
+> The symptom is that creating an API key succeeds, but every call with that
+> `sk-oai-*` key returns HTTP 500
+> `{"error":"Exception thrown while generating token","exceptionCode":"AUTH_FAILURE","refId":"002"}`.
+> Under the hood Authorino's `apiKeyValidation` metadata fetch to
+> `https://maas-api.<infra-ns>.svc.cluster.local:8443/internal/v1/api-keys/validate`
+> fails with `x509: certificate signed by unknown authority`, so the `X-MaaS-Group`
+> header is never injected and maas-api rejects the request.
+>
+> Fixed upstream as RHOAIENG-96854 (opendatahub-io/models-as-a-service#1582).
 
 Wait for Authorino to be available after the rollout:
 
 ```bash
 oc wait --for=condition=Available deployment/authorino \
   -n kuadrant-system --timeout=300s
+```
+
+Verify the bundle is actually readable -- a silent no-op is the expected symptom of
+a wrong path:
+
+```bash
+oc -n kuadrant-system exec deployment/authorino -- \
+  ls -l /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
 ```
 
 ### 7B.5 Verify Authorino TLS

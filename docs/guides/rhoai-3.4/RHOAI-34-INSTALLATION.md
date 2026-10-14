@@ -351,8 +351,8 @@ oc patch authorino authorino -n kuadrant-system --type=merge --patch '{
 
 # 3. Set TLS env vars
 oc -n kuadrant-system set env deployment/authorino \
-  SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
-  REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt
+  SSL_CERT_FILE=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt \
+  REQUESTS_CA_BUNDLE=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
 
 # 4. Annotate gateway
 oc annotate gateway maas-default-gateway -n openshift-ingress \

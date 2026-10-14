@@ -340,13 +340,40 @@ phase1_rhcl() {
     done
 
     oc apply -f "$ROOT_DIR/lib/manifests/rhcl/authorino-tls.yaml"
+
+    # Outbound TLS trust: Authorino calls maas-api's internal validate endpoint at
+    # https://maas-api.<infra-ns>.svc.cluster.local:8443, which presents an OpenShift
+    # service-serving cert signed by openshift-service-serving-signer. Authorino's Go
+    # HTTP client must trust that signer or the AuthConfig `apiKeyValidation` metadata
+    # fetch fails with "x509: certificate signed by unknown authority" -- which makes
+    # every sk-oai-* API key request fail with AUTH_FAILURE / refId 002.
+    #
+    # The Authorino CR has no env field, so we patch the Deployment directly. The
+    # operator reconciles via Server-Side Apply and container env is a listMap keyed on
+    # name, so entries owned by another field manager are merged, not pruned.
+    #
+    # The path MUST be the service-account-projected bundle. The previously used path
+    # /etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt does NOT exist in the
+    # Authorino pod; Go silently ignores an unreadable SSL_CERT_FILE, so the bug was
+    # invisible. See RHOAIENG-96854 / opendatahub-io/models-as-a-service#1582.
+    local service_ca_path=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
     oc -n kuadrant-system set env deployment/authorino \
-        SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
-        REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt 2>/dev/null || true
+        SSL_CERT_FILE="$service_ca_path" \
+        REQUESTS_CA_BUNDLE="$service_ca_path" || \
+        print_warning "Failed to set SSL_CERT_FILE on authorino -- API-key auth will fail"
 
     print_step "Waiting for Authorino deployment to be Available..."
     oc wait --for=condition=Available deployment/authorino -n kuadrant-system --timeout=300s 2>/dev/null || \
         print_warning "Authorino deployment not yet Available -- continuing anyway"
+
+    # Go silently ignores an unreadable SSL_CERT_FILE, so confirm the bundle is really
+    # there rather than trusting that `set env` was enough.
+    if oc -n kuadrant-system exec deployment/authorino -- \
+        test -r "$service_ca_path" 2>/dev/null; then
+        print_success "Authorino trusts the service-serving CA ($service_ca_path)"
+    else
+        print_warning "Authorino cannot read $service_ca_path -- sk-oai-* API keys will fail with AUTH_FAILURE"
+    fi
 
     print_success "Phase 1 complete: RHCL + Kuadrant + Authorino TLS"
 }
