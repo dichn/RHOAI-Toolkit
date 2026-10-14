@@ -20,9 +20,20 @@ spec:
           name: ${OLS_CREDENTIALS_SECRET}
         models:
           - name: ${OLS_MODEL_NAME}
+            contextWindowSize: ${OLS_CONTEXT_WINDOW_SIZE}
             parameters:
-              maxTokensForResponse: 4096
-              toolBudgetRatio: 0.25
+              maxTokensForResponse: 2048
+              # Counterintuitively, LOWER values here were needed to stop
+              # "[LLM Backend] The request exceeds the model's token limit" /
+              # "Prompt is too long" errors -- 0.25 and 0.5 both failed with
+              # an identical reported budget (2048 tokens) despite differing,
+              # which means toolBudgetRatio does not directly gate the
+              # "tool definitions...exceed prompt budget" check the way its
+              # name suggests (it appears to govern a separate tool-execution
+              # budget instead -- see "tool_remaining"/"tools_exec_budget" in
+              # the lightspeed-service-api pod logs). 0.1 was found to work
+              # empirically; not fully understood, re-verify if bumping this.
+              toolBudgetRatio: 0.1
   mcpServers:
     - name: ${MCP_SERVER_NAME}
       url: "http://${MCP_SERVER_NAME}.${MCP_SERVER_NAMESPACE}.svc.cluster.local:8080/mcp"
@@ -34,6 +45,12 @@ spec:
   ols:
     defaultModel: ${OLS_MODEL_NAME}
     defaultProvider: ${OLS_PROVIDER_NAME}
+    # Qwen3's "thinking" mode emits verbose <think>...</think> reasoning blocks
+    # that get replayed back into context on every tool-calling iteration
+    # (maxIterations below), rapidly eating into the model's real context
+    # window. /no_think disables it for models that honor the convention; a
+    # no-op prefix for models that don't.
+    querySystemPrompt: "/no_think"
     conversationCache:
       type: postgres
       postgres:
@@ -48,7 +65,12 @@ spec:
       database:
         replicas: 1
       mcpServer: {}
-    introspectionEnabled: true
+    # Disabled: the built-in read-only "openshift" MCP toolset substantially
+    # overlaps our custom ocp-mcp-server (which also has write access), and
+    # loading both pushed combined tool-definition schemas to ~7500 tokens --
+    # more than the model's entire 8192-token context window can budget for
+    # (see demo/lightspeed-demo/deploy.sh's contextWindowSize detection).
+    introspectionEnabled: false
     logLevel: DEBUG
     maxIterations: 5
     userDataCollection: {}
