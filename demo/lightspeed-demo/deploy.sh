@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 source "$REPO_ROOT/lib/utils/colors.sh" 2>/dev/null || true
+source "$REPO_ROOT/lib/functions/notebook-env.sh" 2>/dev/null || true
 
 DEMO_NAMESPACE="${DEMO_NAMESPACE:-lightspeed-demo}"
 MCP_SERVER_NAMESPACE="${MCP_SERVER_NAMESPACE:-0-test}"
@@ -33,7 +34,11 @@ check_prerequisites() {
         exit 1
     fi
 
-    if ! oc get csv -n openshift-lightspeed 2>/dev/null | grep -q lightspeed-operator; then
+    # Capture into a variable before grep -q: under `set -o pipefail`, grep -q exits
+    # as soon as it finds a match, which can SIGPIPE `oc get csv` mid-write and make
+    # the whole pipeline report failure even though the match succeeded.
+    lightspeed_csvs="$(oc get csv -n openshift-lightspeed 2>/dev/null || true)"
+    if ! grep -q lightspeed-operator <<< "$lightspeed_csvs"; then
         echo_error "OpenShift Lightspeed operator not found. Install it first."
         exit 1
     fi
@@ -48,20 +53,41 @@ check_prerequisites() {
 detect_model() {
     echo_info "Detecting available model for Lightspeed..."
 
-    local isvc_name isvc_ns isvc_url
+    local isvc_name isvc_ns isvc_url model_id=""
+
+    # Prefer classic InferenceService (has a simple .status.url we can query directly)
     isvc_name=$(oc get inferenceservice --all-namespaces -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
     isvc_ns=$(oc get inferenceservice --all-namespaces -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null || true)
 
+    if [[ -n "$isvc_name" ]]; then
+        isvc_url=$(oc get inferenceservice "$isvc_name" -n "$isvc_ns" -o jsonpath='{.status.url}' 2>/dev/null)
+        # .status.url is an external route reachable from this shell, so the
+        # /v1/models lookup below works for this path.
+    elif declare -F detect_llm_endpoint &>/dev/null && detect_llm_endpoint; then
+        # Fall back to LLMInferenceService (RHOAI 3.5+ / MaaS-deployed models) via
+        # the in-cluster workload service -- see lib/functions/notebook-env.sh.
+        isvc_name="$LLM_MODEL_NAME"
+        isvc_ns="$LLM_MODEL_NS"
+        isvc_url="${LLM_BASE_URL%/v1}"
+        # LLM_BASE_URL is a *.svc.cluster.local address, unreachable from this
+        # shell (it's only resolvable inside the cluster's pod network), so the
+        # curl-based /v1/models lookup below would always fail here. The vLLM
+        # served model ID also differs from the K8s resource name (e.g.
+        # "RedHatAI/Qwen3-8B-FP8-dynamic" vs "qwen3-8b") -- read it directly
+        # from the LLMInferenceService spec instead.
+        model_id=$(oc get llminferenceservice "$isvc_name" -n "$isvc_ns" \
+            -o jsonpath='{.spec.model.name}' 2>/dev/null || true)
+    fi
+
     if [[ -z "$isvc_name" ]]; then
-        echo_error "No InferenceService found. Deploy a model first."
+        echo_error "No InferenceService or LLMInferenceService found. Deploy a model first."
         exit 1
     fi
 
-    isvc_url=$(oc get inferenceservice "$isvc_name" -n "$isvc_ns" -o jsonpath='{.status.url}' 2>/dev/null)
-
-    # Query model name from vLLM /v1/models endpoint
-    local model_id
-    model_id=$(curl -sk "${isvc_url}/v1/models" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null || echo "$isvc_name")
+    # Query model name from vLLM /v1/models endpoint (skipped if already resolved above)
+    if [[ -z "$model_id" ]]; then
+        model_id=$(curl -sk "${isvc_url}/v1/models" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null || echo "$isvc_name")
+    fi
 
     export OLS_MODEL_NAME="$model_id"
     export OLS_MODEL_URL="${isvc_url}/v1"
