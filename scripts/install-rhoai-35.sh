@@ -56,6 +56,7 @@ source "$ROOT_DIR/lib/functions/metallb.sh" 2>/dev/null || true
 source "$ROOT_DIR/lib/functions/usage-logging.sh" 2>/dev/null || true
 source "$ROOT_DIR/lib/functions/rhcl-install.sh" 2>/dev/null || true
 source "$ROOT_DIR/lib/functions/install-common.sh" 2>/dev/null || true
+source "$ROOT_DIR/lib/functions/pipeline-server.sh" 2>/dev/null || true
 
 # Default options
 SKIP_PREREQUISITES=false
