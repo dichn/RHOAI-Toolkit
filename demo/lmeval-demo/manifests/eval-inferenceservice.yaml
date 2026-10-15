@@ -1,0 +1,48 @@
+# InferenceService for EvalHub benchmarks — provides an HTTP model endpoint.
+#
+# EvalHub's job sidecar expects an HTTP model URL (not HTTPS/service-ca).
+# LLMInferenceService wraps vLLM in TLS (--ssl-certfile), which the sidecar
+# can't verify. A standard InferenceService with RawDeployment mode gives
+# an HTTP predictor service on port 80 that EvalHub works with.
+#
+# The model URL for EvalHub SDK notebooks is:
+#   http://qwen3-8b-eval-predictor.llm.svc.cluster.local/v1
+#
+# This does NOT replace the LLMInferenceService used for MaaS — it's a
+# separate deployment specifically for EvalHub benchmarks.
+---
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: qwen3-8b-eval
+  namespace: llm
+  annotations:
+    serving.kserve.io/deploymentMode: RawDeployment
+    opendatahub.io/hardware-profile-name: gpu-profile
+    opendatahub.io/hardware-profile-namespace: redhat-ods-applications
+    opendatahub.io/hardware-profile-resource-version: "1"
+spec:
+  predictor:
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+    nodeSelector:
+      nvidia.com/gpu.present: "true"
+    model:
+      modelFormat:
+        name: vLLM
+      runtime: vllm-rhaiis
+      storageUri: oci://quay.io/redhat-ai-services/modelcar-catalog:qwen3-8b
+      resources:
+        limits:
+          cpu: "4"
+          memory: "16Gi"
+          nvidia.com/gpu: "1"
+        requests:
+          cpu: "2"
+          memory: "8Gi"
+          nvidia.com/gpu: "1"
+      args:
+        - "--max-model-len"
+        - "4096"

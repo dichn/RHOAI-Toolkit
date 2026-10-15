@@ -74,6 +74,12 @@ REPO_PATH=$(get_repo_path "lmeval-builder-lab")
 
 ensure_namespace "$NAMESPACE"
 oc label namespace "$NAMESPACE" opendatahub.io/dashboard=true --overwrite 2>/dev/null || true
+# Register as EvalHub tenant (per RHOAI 3.5 docs Section 2.28). The tenant
+# label triggers TrustyAI Operator to provision job SA, RBAC, and service-ca.
+# The generated-namespace label passes the default-deny NetworkPolicy in
+# redhat-ods-applications so job sidecars can callback to EvalHub on :8443.
+oc label namespace "$NAMESPACE" evalhub.trustyai.opendatahub.io/tenant= --overwrite 2>/dev/null || true
+oc label namespace "$NAMESPACE" opendatahub.io/generated-namespace=true --overwrite 2>/dev/null || true
 
 # Enable observability dashboard for EvalHub metrics
 oc patch odhdashboardconfig odh-dashboard-config -n redhat-ods-applications \
@@ -146,6 +152,32 @@ else
     print_warning "EvalHub CRD not available. Ensure TrustyAI is Managed in your DSC."
     print_info "EvalHub requires RHOAI 3.4+ with trustyai.managementState: Managed"
     EVALHUB_URL="(not deployed -- EvalHub CRD not available)"
+fi
+
+# --- Deploy HTTP InferenceService for EvalHub benchmarks ---
+# EvalHub job sidecars expect an HTTP model endpoint (not HTTPS/service-ca).
+# LLMInferenceService wraps vLLM in TLS which the sidecar can't verify.
+# A standard InferenceService with RawDeployment gives HTTP on port 80.
+print_step "Deploying HTTP model endpoint for EvalHub benchmarks..."
+if ! oc get inferenceservice qwen3-8b-eval -n llm &>/dev/null; then
+    # Ensure vLLM ServingRuntime exists
+    if ! oc get servingruntime vllm-rhaiis -n llm &>/dev/null; then
+        if oc get servingruntime vllm-rhaiis -n redhat-ods-applications &>/dev/null; then
+            oc get servingruntime vllm-rhaiis -n redhat-ods-applications -o json \
+                | jq '.metadata.namespace = "llm" | del(.metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.managedFields)' \
+                | oc apply -f - 2>/dev/null
+        else
+            "$ROOT_DIR/scripts/add-serving-runtime.sh" --preset vllm-redhat 2>/dev/null || true
+            oc get servingruntime vllm-rhaiis -n redhat-ods-applications -o json \
+                | jq '.metadata.namespace = "llm" | del(.metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.managedFields)' \
+                | oc apply -f - 2>/dev/null || true
+        fi
+    fi
+    oc apply -f "$SCRIPT_DIR/manifests/eval-inferenceservice.yaml" 2>/dev/null
+    print_info "qwen3-8b-eval InferenceService deploying (HTTP endpoint for EvalHub)"
+    print_info "Model URL: http://qwen3-8b-eval-predictor.llm.svc.cluster.local/v1"
+else
+    print_info "qwen3-8b-eval InferenceService already exists"
 fi
 
 # --- Generate demo-config.env for vendored notebooks ---
