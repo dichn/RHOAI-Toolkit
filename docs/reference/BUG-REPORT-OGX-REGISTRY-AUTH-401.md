@@ -1,6 +1,6 @@
 # Bug Report: OGXServer Reconciliation Fails with HTTP 401 Fetching OCI Config Labels
 
-**Status**: Open, unresolved. Recommended action: file a Red Hat support case.
+**Status**: Open (upstream bug), **workaround available** — see "Workaround / Current State" below. Filed as [RHOAIENG-96724](https://redhat.atlassian.net/browse/RHOAIENG-96724).
 
 **Component**: OGX Operator (`ogx-k8s-operator`, replaces the Llama Stack Operator in RHOAI 3.5+)
 
@@ -169,18 +169,49 @@ everything already attempted at the cluster/manifest level.
 
 ## Workaround / Current State
 
-None found that unblocks `OGXServer` itself. As a partial mitigation, the
-non-OGX AutoRAG infrastructure (S3-compatible storage, Milvus, Postgres,
-embedding model, sample docs/data connection) deploys and runs healthy
-independently — only the OGX-based RAG orchestration layer itself is
-blocked.
+**Workaround found (RHOAIENG-96724, Oct 2026):** Supply the base OGX configuration
+via a ConfigMap (`spec.baseConfig`) to bypass the failing anonymous OCI-label fetch.
+Two steps are needed:
+
+1. **Extract the base config from the pinned image digest** using a working
+   `registry.redhat.io` credential (the cluster's pull-secret works):
+   ```bash
+   DIGEST=$(oc get deployment -n redhat-ods-applications -l app.kubernetes.io/name=ogx-k8s-operator \
+       -o jsonpath='{.items[0].spec.template.spec.containers[0].env[?(@.name=="RELATED_IMAGE_ODH_OGX_CORE_IMAGE")].value}')
+   oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d > /tmp/ps.json
+   oc image info "$DIGEST" --registry-config=/tmp/ps.json --filter-by-os=linux/amd64 -o json | \
+       python3 -c "import json,sys,base64; d=json.load(sys.stdin); print(base64.b64decode(d['config']['config']['Labels']['com.ogx.config.config.yaml']).decode())" \
+       > /tmp/ogx-config.yaml
+   rm /tmp/ps.json
+   ```
+
+2. **Create a ConfigMap and patch the OGXServer:**
+   ```bash
+   oc create configmap rh-ogx-base-config --from-file=config.yaml=/tmp/ogx-config.yaml -n <namespace>
+   oc label configmap rh-ogx-base-config ogx.io/watch=true -n <namespace>
+   oc patch ogxserver <name> -n <namespace> --type=merge \
+       -p '{"spec":{"baseConfig":{"name":"rh-ogx-base-config","key":"config.yaml"}}}'
+   ```
+
+3. **CRITICAL: Label ALL Secrets referenced by the OGXServer with `ogx.io/watch: "true"`:**
+   ```bash
+   oc label secret ogx-secret ogx.io/watch=true -n <namespace>
+   ```
+   Without this label, the operator's namespace-scoped cache cannot see the Secret
+   and reports "Secret not found" even though it exists and RBAC allows access.
+   This is a separate bug from the OCI 401 — the operator only watches resources
+   with the `ogx.io/watch` label across namespaces.
+
+**Result:** OGXServer moves from `Phase: Failed (ConfigGenerationFailed: HTTP 401)` to
+`Phase: Initializing (ConfigGenerated: succeeded, 13 providers)`. The deployment then
+depends on GPU node availability for the workload pod to schedule.
+
+`demo/autorag-demo/deploy.sh` now applies this workaround automatically when
+`USE_OGX=true` (RHOAI 3.5+).
 
 `redhat-registry-pull-secret` and the `$HOME/.docker/config.json` volume
-mounts added to both OGX operator Deployments during investigation (see
-ruled-out item #4) were left in place — they are harmless, and in case a
-future operator patch changes its credential-resolution logic to honor that
-convention, the mount is already there and would "just work" without
-further toolkit changes.
+mounts added to both OGX operator Deployments during the original investigation (see
+ruled-out item #4) were left in place — they are harmless.
 
 ## References
 

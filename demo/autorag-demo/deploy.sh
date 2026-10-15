@@ -312,7 +312,61 @@ export MILVUS_ENDPOINT
 export MILVUS_TOKEN=""
 
 if [ "$USE_OGX" = true ]; then
+    # Workaround for RHOAIENG-96724: OGX operator's OCI-label-fetch uses anonymous
+    # HTTP requests to registry.redhat.io, which returns HTTP 401. Supply the base
+    # config via a ConfigMap (spec.baseConfig) to bypass the failing OCI path.
+    # Also: secrets referenced by OGXServer need the ogx.io/watch label, or the
+    # operator's scoped cache won't see them ("Secret not found" even though it exists).
+    print_step "Applying OGX workaround (RHOAIENG-96724: supply base config via ConfigMap)..."
+    local _ogx_digest
+    _ogx_digest=$(oc get deployment -n redhat-ods-applications -l app.kubernetes.io/name=ogx-k8s-operator \
+        -o jsonpath='{.items[0].spec.template.spec.containers[0].env[?(@.name=="RELATED_IMAGE_ODH_OGX_CORE_IMAGE")].value}' 2>/dev/null)
+    
+    if [ -n "$_ogx_digest" ] && ! oc get configmap rh-ogx-base-config -n "$NAMESPACE" &>/dev/null; then
+        print_step "Extracting OGX base config from OCI image labels..."
+        local _pull_secret_file
+        _pull_secret_file=$(mktemp)
+        oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d > "$_pull_secret_file" 2>/dev/null
+        
+        local _config_yaml
+        _config_yaml=$(oc image info "$_ogx_digest" --registry-config="$_pull_secret_file" --filter-by-os=linux/amd64 -o json 2>/dev/null | \
+            python3 -c "
+import json, sys, base64
+d = json.load(sys.stdin)
+labels = d.get('config',{}).get('config',{}).get('Labels',{})
+val = labels.get('com.ogx.config.config.yaml','')
+try: print(base64.b64decode(val).decode())
+except: print(val)
+" 2>/dev/null)
+        rm -f "$_pull_secret_file"
+        
+        if [ -n "$_config_yaml" ]; then
+            oc create configmap rh-ogx-base-config \
+                --from-literal=config.yaml="$_config_yaml" \
+                -n "$NAMESPACE" --dry-run=client -o yaml | \
+                python3 -c "
+import yaml, sys
+d = yaml.safe_load(sys.stdin)
+d['metadata']['labels'] = {'ogx.io/watch': 'true'}
+yaml.dump(d, sys.stdout, default_flow_style=False)
+" | oc apply -f -
+            print_success "OGX base config ConfigMap created (bypasses OCI 401)"
+        else
+            print_warning "Could not extract OGX base config from image -- OGXServer may fail with HTTP 401"
+            print_info "See docs/reference/BUG-REPORT-OGX-REGISTRY-AUTH-401.md for manual workaround"
+        fi
+    elif oc get configmap rh-ogx-base-config -n "$NAMESPACE" &>/dev/null; then
+        print_success "OGX base config ConfigMap already exists [SKIP]"
+    fi
+
     envsubst < "$SCRIPT_DIR/manifests/ogxserver.yaml" | oc apply -f -
+    
+    # Patch OGXServer to use the baseConfig ConfigMap (if created above)
+    if oc get configmap rh-ogx-base-config -n "$NAMESPACE" &>/dev/null; then
+        oc patch ogxserver autorag-ogx -n "$NAMESPACE" --type=merge \
+            -p '{"spec":{"baseConfig":{"name":"rh-ogx-base-config","key":"config.yaml"}}}' 2>/dev/null || true
+    fi
+    
     print_info "OGX deploying (takes 1-2 minutes)..."
 
     # Wait briefly for OGX pod to start (deployment/service named after the CR: autorag-ogx)
