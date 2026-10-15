@@ -85,7 +85,10 @@ envsubst < "$SCRIPT_DIR/manifests/lmeval-rbac.yaml" | oc apply -f -
 
 print_step "Deploying EvalHub service (TrustyAI Operator CR)..."
 EVALHUB_NAMESPACE="redhat-ods-applications"
-export MLFLOW_TRACKING_URI="https://mlflow.${EVALHUB_NAMESPACE}.svc:8443"
+# MLflow is started with --static-prefix=/mlflow, so all API paths live under
+# /mlflow/. Without this prefix, EvalHub's /version probe 404s and workspace
+# negotiation fails (MLflow returns "Workspace context is required").
+export MLFLOW_TRACKING_URI="https://mlflow.${EVALHUB_NAMESPACE}.svc:8443/mlflow"
 
 if [ "$EVALHUB_CRD_AVAILABLE" = true ]; then
     if oc get evalhub evalhub -n "$EVALHUB_NAMESPACE" &>/dev/null; then
@@ -240,9 +243,59 @@ ensure_workbench "$NAMESPACE" "model-benchmarking"
 # trustyai-operator-lmevaljob-editor-role via lmeval-rbac.yaml above, unlike
 # the workbench's own default SA which has no EvalHub-related RBAC.
 source "$ROOT_DIR/lib/functions/notebook-env.sh"
+
+# Resolve MODEL_SERVED_NAME (HuggingFace model ID) and HF_MODEL_ID for the
+# EvalHub SDK notebooks. inject_notebook_env auto-detects MODEL_NAME (k8s
+# resource name, e.g. "qwen3-8b") but the EvalHub SDK needs the served model
+# name (e.g. "RedHatAI/Qwen3-8B-FP8-dynamic") which is the spec.model.name
+# from the LLMInferenceService (or spec.predictor.model.modelFormat.name for
+# InferenceService). These often differ from the k8s resource name.
+detect_llm_endpoint "$NAMESPACE" || true
+detect_direct_llm_endpoint "$NAMESPACE" || true
+HF_MODEL_ID=""
+MODEL_SERVED_NAME=""
+if [ -n "${LLM_MODEL_NAME:-}" ]; then
+    # LLMInferenceService: spec.model.name is the HF model ID
+    HF_MODEL_ID=$(oc get llminferenceservice "${LLM_MODEL_NAME}" -n "${LLM_MODEL_NS}" \
+        -o jsonpath='{.spec.model.name}' 2>/dev/null || true)
+    if [ -z "$HF_MODEL_ID" ]; then
+        # InferenceService fallback
+        HF_MODEL_ID=$(oc get inferenceservice "${LLM_MODEL_NAME}" -n "${LLM_MODEL_NS}" \
+            -o jsonpath='{.metadata.annotations.serving\.kserve\.io/deploymentMode}' 2>/dev/null || true)
+    fi
+    MODEL_SERVED_NAME="${HF_MODEL_ID:-${LLM_MODEL_NAME}}"
+fi
+
+# DIRECT_ROUTE_URL: LLMInferenceService models on RHOAI 3.5 have no external
+# route (only the MaaS gateway). The EvalHub lm_evaluation_harness provider
+# runs inside the cluster, so the internal workload service URL works fine.
+# Fall back to it when DIRECT_ROUTE_URL is unset.
+if [ -z "${DIRECT_ROUTE_URL:-}" ] && [ -n "${DIRECT_BASE_URL:-}" ]; then
+    DIRECT_ROUTE_URL="${DIRECT_BASE_URL}"
+fi
+
+# EvalHub URL: prefer the external route over the internal service. The
+# internal service (port 8443) is blocked by NetworkPolicy to workbench pods
+# in other namespaces; the external route goes through the OpenShift router
+# and works from any namespace.
+EVALHUB_NAMESPACE="redhat-ods-applications"
+EVALHUB_EXTERNAL=""
+EVALHUB_EXTERNAL=$(oc get route -l app=eval-hub -n "$EVALHUB_NAMESPACE" \
+    -o jsonpath='{.items[0].spec.host}' 2>/dev/null || true)
+if [ -n "$EVALHUB_EXTERNAL" ]; then
+    EVALHUB_OVERRIDE="https://${EVALHUB_EXTERNAL}"
+else
+    EVALHUB_OVERRIDE="https://evalhub.${EVALHUB_NAMESPACE}.svc:8443"
+fi
+
 inject_notebook_env "$NAMESPACE" \
-    "MLFLOW_TRACKING_URI=https://mlflow.redhat-ods-applications.svc:8443" \
-    "LIMIT=5"
+    "MLFLOW_TRACKING_URI=https://mlflow.${EVALHUB_NAMESPACE}.svc:8443" \
+    "LIMIT=5" \
+    "MODEL_SERVED_NAME=${MODEL_SERVED_NAME}" \
+    "HF_MODEL_ID=${HF_MODEL_ID}" \
+    "MODEL_ID=${HF_MODEL_ID}" \
+    "DIRECT_ROUTE_URL=${DIRECT_ROUTE_URL}" \
+    "EVALHUB_URL=${EVALHUB_OVERRIDE}"
 print_success "notebook-env ConfigMap created (auto-injected into workbenches)"
 
 # --- Retry the repo clone in case the workbench wasn't Running yet when

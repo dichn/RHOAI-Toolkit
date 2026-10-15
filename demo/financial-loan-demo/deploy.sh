@@ -342,6 +342,18 @@ source "$ROOT_DIR/lib/functions/notebook-env.sh"
 # had the new seaweedfs-s3:8333 endpoint while notebook-env still had
 # minio:9000/minio/minio123. Fixed to use the same S3_EP/S3_ACCESS_KEY/
 # S3_SECRET_KEY variables the data-connection Secret above uses.
+# Resolve Model Registry URL for notebooks that register models.
+# Port 8080 is the REST API (no auth); port 8443 is the kube-rbac-proxy
+# endpoint (requires SA auth). Notebooks use requests.get() without auth,
+# so port 8080 is the correct default.
+REGISTRY_NS="rhoai-model-registries"
+REGISTRY_NAME="model-registry"
+if oc get svc "$REGISTRY_NAME" -n "$REGISTRY_NS" &>/dev/null; then
+    MODEL_REGISTRY_URL="http://${REGISTRY_NAME}.${REGISTRY_NS}.svc:8080"
+else
+    MODEL_REGISTRY_URL=""
+fi
+
 inject_notebook_env "$NAMESPACE" \
     "S3_ENDPOINT=${S3_EP}" \
     "AWS_ACCESS_KEY_ID=${S3_ACCESS_KEY:-admin}" \
@@ -349,7 +361,9 @@ inject_notebook_env "$NAMESPACE" \
     "S3_BUCKET_DATA=datasets" \
     "S3_BUCKET_MODELS=models" \
     "HF_MODEL_ID=${HF_MODEL_ID:-RedHatAI/Qwen3-8B-FP8-dynamic}" \
-    "LLM_URL=${LLM_URL}"
+    "FINETUNE_MODEL_ID=Qwen/Qwen3-4B-Instruct-2507" \
+    "LLM_URL=${LLM_URL}" \
+    "MODEL_REGISTRY_URL=${MODEL_REGISTRY_URL}"
 # NOTE: do NOT also pass SKLEARN_API_URL here -- inject_notebook_env already
 # calls detect_predictive_endpoint internally and adds SKLEARN_MODEL_NAME +
 # SKLEARN_API_URL to the ConfigMap automatically when a predictive model is

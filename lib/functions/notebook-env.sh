@@ -308,6 +308,19 @@ inject_notebook_env() {
         cm_args+=("--from-literal=BASE_URL=${LLM_BASE_URL}")
         cm_args+=("--from-literal=LLM_API_URL=${LLM_BASE_URL}/chat/completions")
         cm_args+=("--from-literal=LLM_MODEL_NAME=${LLM_MODEL_NAME}")
+
+        # Resolve the HuggingFace model ID (spec.model.name from
+        # LLMInferenceService, or spec.predictor.model.modelFormat.name from
+        # InferenceService). Many notebooks need this as MODEL_SERVED_NAME
+        # (the OpenAI-compatible model name in /v1/models) or HF_MODEL_ID
+        # (the tokenizer/model card ID).
+        local _hf_model_id=""
+        _hf_model_id=$(oc get llminferenceservice "${LLM_MODEL_NAME}" -n "${LLM_MODEL_NS}" \
+            -o jsonpath='{.spec.model.name}' 2>/dev/null || true)
+        if [ -n "$_hf_model_id" ]; then
+            cm_args+=("--from-literal=HF_MODEL_ID=${_hf_model_id}")
+            cm_args+=("--from-literal=MODEL_ID=${_hf_model_id}")
+        fi
     fi
 
     if [ -n "${DIRECT_MODEL_NAME:-}" ]; then

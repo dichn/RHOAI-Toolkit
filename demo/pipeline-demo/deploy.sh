@@ -111,6 +111,20 @@ print_info "Namespace: $NAMESPACE"
 source "$ROOT_DIR/lib/functions/workbench.sh"
 ensure_workbench "$NAMESPACE" "ai-pipelines"
 
+# --- Grant workbench SA access to the DSPA pipeline API ---
+# The KFP SDK client connects to the ds-pipeline DSPA proxy endpoint which
+# requires the ds-pipeline-user-access-dspa ClusterRole. Without this, the
+# workbench SA gets 403 Forbidden when calling client.upload_pipeline() etc.
+print_step "Granting pipeline API access to workbench SA..."
+oc create rolebinding pipeline-api-access-ai-pipelines \
+    --clusterrole=ds-pipeline-user-access-dspa \
+    --serviceaccount="${NAMESPACE}:ai-pipelines" \
+    -n "$NAMESPACE" 2>/dev/null || true
+# Also grant edit so the SA can create Argo workflows for pipeline runs
+oc adm policy add-role-to-user edit \
+    "system:serviceaccount:${NAMESPACE}:ai-pipelines" \
+    -n "$NAMESPACE" 2>/dev/null || true
+
 # --- Inject notebook environment variables into workbench ---
 source "$ROOT_DIR/lib/functions/notebook-env.sh"
 S3_EP="$(get_storage_endpoint "$NAMESPACE")"
