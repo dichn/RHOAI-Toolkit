@@ -117,6 +117,21 @@ if [ "$EVALHUB_CRD_AVAILABLE" = true ]; then
     oc create sa evalhub-${EVALHUB_NAMESPACE}-job -n "$NAMESPACE" 2>/dev/null || true
     oc adm policy add-role-to-user edit "system:serviceaccount:${NAMESPACE}:evalhub-${EVALHUB_NAMESPACE}-job" -n "$NAMESPACE" 2>/dev/null || true
 
+    # Create the service-ca ConfigMap that EvalHub job pods mount for TLS.
+    # Without this, job pods get stuck in Init:0/1 with:
+    #   MountVolume.SetUp failed for volume "evalhub-service-ca": configmap not found
+    # The annotation tells OpenShift to inject the cluster CA bundle.
+    oc apply -f - <<EOCM 2>/dev/null || true
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: evalhub-service-ca
+  namespace: ${NAMESPACE}
+  annotations:
+    service.beta.openshift.io/inject-cabundle: "true"
+data: {}
+EOCM
+
     # Grant job SA access to MLflow experiments (required for results to appear in MLflow UI)
     envsubst '${NAMESPACE} ${EVALHUB_NAMESPACE}' < "$SCRIPT_DIR/manifests/evalhub-job-mlflow-rbac.yaml.tmpl" | oc apply -f -
 

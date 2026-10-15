@@ -396,12 +396,22 @@ EOROLE
         fi
     fi
 
-    # Append extra key=value pairs from arguments
+    # Append extra key=value pairs from arguments.
+    # Skip keys already added by auto-detection above to avoid
+    # "another key by that name already exists" from oc create configmap.
+    local _existing_keys=""
+    local _cm_arg
+    for _cm_arg in "${cm_args[@]}"; do
+        _existing_keys="${_existing_keys} ${_cm_arg#--from-literal=}"
+    done
     local arg
     for arg in "$@"; do
         if [[ "$arg" == *=* ]]; then
             local key="${arg%%=*}"
             local value="${arg#*=}"
+            if echo "$_existing_keys" | grep -q "${key}="; then
+                continue
+            fi
             [ -n "$value" ] && cm_args+=("--from-literal=${key}=${value}")
         fi
     done
