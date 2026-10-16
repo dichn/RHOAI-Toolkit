@@ -484,6 +484,23 @@ EOF
         done
     fi
 
+    # Bug fix: the Perses Operator creates the Service with a selector that
+    # includes 'instance: data-science-perses' but the StatefulSet pod template
+    # only has 'app.kubernetes.io/instance: data-science-perses' (with prefix).
+    # This mismatch causes zero endpoints → ECONNREFUSED → the RHOAI
+    # Observability Dashboard shows "Internal Server Error". Patch the
+    # StatefulSet to include the missing label.
+    if oc get statefulset data-science-perses -n "$mon_ns" &>/dev/null; then
+        local _has_label
+        _has_label=$(oc get statefulset data-science-perses -n "$mon_ns" \
+            -o jsonpath='{.spec.template.metadata.labels.instance}' 2>/dev/null)
+        if [ -z "$_has_label" ]; then
+            oc patch statefulset data-science-perses -n "$mon_ns" --type=merge \
+                -p '{"spec":{"template":{"metadata":{"labels":{"instance":"data-science-perses"}}}}}' 2>/dev/null && \
+                print_success "Patched Perses StatefulSet with missing 'instance' label (Service selector fix)" || true
+        fi
+    fi
+
     # NetworkPolicy: allow perses-operator (in openshift-cluster-observability-operator)
     # to sync PersesDashboard and PersesDatasource CRs with the Perses server.
     # Also allow from openshift-operators (fallback) and redhat-ods-monitoring (self).
@@ -723,6 +740,10 @@ enable_dashboard_features() {
     #   roleManagement: true          - Custom RBAC role creation UI for data science projects
     #                                   (enabled by default in 3.5, set explicitly for clarity)
     #   mcpCatalog: true              - MCP Catalog under AI Hub (requires MCP Lifecycle Operator)
+    #   agentsCatalog: true           - Agent Catalog (browse/deploy agent templates, 3.5+)
+    #   agentOps: true                - Agent Operations (agent lifecycle management, 3.5+)
+    #   agentConfigManagement: true   - Agent Config Management (agent settings, 3.5+)
+    #   gpuaas: true                  - GPU-as-a-Service (GPU resource management, 3.5+)
     #
     # REMOVED in 3.5 (CEL validation rejects setting these):
     #   maasAuthPolicies              - no longer a settable flag, baked into MaaS GA
@@ -740,7 +761,17 @@ enable_dashboard_features() {
                 "vLLMDeploymentOnMaaS": true,
                 "disableLMEval": false,
                 "mcpCatalog": true,
-                "roleManagement": true
+                "roleManagement": true,
+                "agentsCatalog": true,
+                "agentOps": true,
+                "agentConfigManagement": true,
+                "gpuaas": true
+            },
+            "genAiStudioConfig": {
+                "aiAssetCustomEndpoints": {
+                    "clusterDomains": [],
+                    "externalProviders": true
+                }
             }
         }
     }'
@@ -758,6 +789,10 @@ enable_dashboard_features() {
                     "disableLMEval": false,
                     "mcpCatalog": true,
                     "roleManagement": true,
+                    "agentsCatalog": true,
+                    "agentOps": true,
+                    "agentConfigManagement": true,
+                    "gpuaas": true,
                     "automl": true,
                     "autorag": true,
                     "observabilityDashboard": true,
@@ -775,6 +810,12 @@ enable_dashboard_features() {
                     "deploymentWizardYAMLViewer": true,
                     "aiAssetCustomEndpoints": true,
                     "globalProjectPrompts": true
+                },
+                "genAiStudioConfig": {
+                    "aiAssetCustomEndpoints": {
+                        "clusterDomains": [],
+                        "externalProviders": true
+                    }
                 }
             }
         }'
@@ -791,7 +832,17 @@ enable_dashboard_features() {
                     "observabilityDashboard": true,
                     "disableLMEval": false,
                     "mcpCatalog": true,
-                    "roleManagement": true
+                    "roleManagement": true,
+                    "agentsCatalog": true,
+                    "agentOps": true,
+                    "agentConfigManagement": true,
+                    "gpuaas": true
+                },
+                "genAiStudioConfig": {
+                    "aiAssetCustomEndpoints": {
+                        "clusterDomains": [],
+                        "externalProviders": true
+                    }
                 }
             }
         }'
