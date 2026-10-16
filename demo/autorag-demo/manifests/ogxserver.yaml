@@ -1,57 +1,106 @@
 ---
-# OGX Secret - Connection details for LLM, embedding (kept for parity/reference;
-# OGX's native providers.inference.remote.vllm fields are used directly below
-# instead of env-var injection, but PostgreSQL creds still flow through a secret)
+# PGVector database for OGX memory layer (vector_io + responses persistence).
+# The OGX base config (llama-stack-config) references PGVECTOR_* env vars
+# which are injected via workload.overrides.env on the OGXServer.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: genai-pgvector-storage
+  namespace: ${NAMESPACE}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
 apiVersion: v1
 kind: Secret
 metadata:
-  name: ogx-secret
+  name: genai-pgvector-credentials
+  namespace: ${NAMESPACE}
+type: Opaque
+stringData:
+  password: "${PGVECTOR_PASSWORD}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: genai-pgvector
   namespace: ${NAMESPACE}
   labels:
-    ogx.io/watch: "true"
-type: Opaque
-stringData:
-  INFERENCE_MODEL: "${INFERENCE_MODEL}"
-  VLLM_URL: "${VLLM_URL}"
-  VLLM_API_TOKEN: "${VLLM_API_TOKEN}"
-  EMBEDDING_MODEL: "${EMBEDDING_MODEL}"
-  VLLM_EMBEDDING_URL: "${VLLM_EMBEDDING_URL}"
-  VLLM_EMBEDDING_API_TOKEN: "${VLLM_EMBEDDING_API_TOKEN}"
+    app: genai-pgvector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: genai-pgvector
+  template:
+    metadata:
+      labels:
+        app: genai-pgvector
+    spec:
+      containers:
+      - name: pgvector
+        image: registry.redhat.io/rhel9/postgresql-16:latest
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRESQL_USER
+          value: vectoruser
+        - name: POSTGRESQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: genai-pgvector-credentials
+              key: password
+        - name: POSTGRESQL_DATABASE
+          value: vectordb
+        volumeMounts:
+        - name: pgdata
+          mountPath: /var/lib/pgsql/data
+        - name: init
+          mountPath: /opt/app-root/src/postgresql-start
+      volumes:
+      - name: pgdata
+        persistentVolumeClaim:
+          claimName: genai-pgvector-storage
+      - name: init
+        configMap:
+          name: genai-pgvector-init
 ---
-# Milvus connection secret (token optional -- Milvus standalone here has no auth)
 apiVersion: v1
-kind: Secret
+kind: ConfigMap
 metadata:
-  name: milvus-connection-secret
+  name: genai-pgvector-init
   namespace: ${NAMESPACE}
-type: Opaque
-stringData:
-  MILVUS_ENDPOINT: "${MILVUS_ENDPOINT}"
-  MILVUS_TOKEN: "${MILVUS_TOKEN}"
+data:
+  enable-pgvector.sh: |
+    #!/bin/bash
+    psql -d vectordb -c "CREATE EXTENSION IF NOT EXISTS vector;"
 ---
-# OGXServer - Remote Milvus + Remote Embeddings (bge-m3) - RHOAI 3.5+
-# REPLACES manifests/llamastack.yaml (LlamaStackDistribution) for 3.5+.
-# Field mapping confirmed via `oc explain ogxserver.spec --recursive` on a live
-# RHOAI 3.5.0 cluster and cross-checked against:
-#   docs/reference/RHAIE 3.5 Guide/..-Working_with_OGX-en-US.pdf.md (SS1.1)
+apiVersion: v1
+kind: Service
+metadata:
+  name: genai-pgvector
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: genai-pgvector
+  ports:
+  - port: 5432
+    targetPort: 5432
+---
+# OGXServer — uses overrideConfig (not baseConfig) to completely bypass the
+# operator's config generation. The llama-stack-config ConfigMap from the
+# working Playground setup provides all provider definitions. Env vars for
+# vLLM, pgvector, etc. are injected via workload.overrides.env.
 #
-# Key differences from llamastack.yaml:
-#   - apiVersion/kind: llamastack.io/v1alpha1 LlamaStackDistribution -> ogx.io/v1beta1 OGXServer
-#   - spec.replicas -> spec.workload.replicas
-#   - spec.server.containerSpec.{resources,env} -> spec.workload.{resources,overrides.env}
-#   - spec.server.distribution.name -> spec.distribution.name (top-level; "rh" is the
-#     current non-deprecated value -- "rh-dev" is deprecated, "starter"/"remote-vllm"
-#     from the CRD godoc comment are NOT valid on GA and are rejected by the webhook)
-#   - spec.network.exposeRoute / allowedFrom -> spec.network.externalAccess.enabled /
-#     spec.network.policy.ingress (same-namespace + operator-namespace access is
-#     already allowed by default, so no custom policy is required for this demo)
-#   - LLM/embedding vLLM connections are now native typed fields under
-#     spec.providers.inference.remote.vllm[] (endpoint/apiToken) instead of generic
-#     env-var injection referencing a Secret
-#   - Milvus is now a native typed field under spec.providers.vectorIo.remote.milvus[]
-#     (uri/token/consistencyLevel) instead of generic env-var injection
-#   - PostgreSQL metadata store env vars (POSTGRES_*, FMS_ORCHESTRATOR_URL) have no
-#     native field and still go through spec.workload.overrides.env
+# Key learnings (Oct 2026):
+#   - distribution "rh-dev" works with overrideConfig; "rh" + baseConfig triggers
+#     the operator's config merge which strips fields the Python runtime needs
+#   - overrideConfig bypasses the operator entirely — the ConfigMap IS the config
+#   - No providers in the CRD spec — everything comes from the ConfigMap
+#   - VLLM_API_TOKEN must be non-empty (OGX crashes on empty env vars)
 apiVersion: ogx.io/v1beta1
 kind: OGXServer
 metadata:
@@ -63,60 +112,57 @@ metadata:
     opendatahub.io/dashboard: "true"
 spec:
   distribution:
-    name: rh
-  workload:
-    replicas: 1
-    resources:
-      requests:
-        cpu: "250m"
-        memory: "500Mi"
-      limits:
-        cpu: "4"
-        memory: "12Gi"
-    storage:
-      size: 5Gi
-    overrides:
-      env:
-        # PostgreSQL metadata store (required since RHOAI 3.4; no native OGX field)
-        - name: POSTGRES_HOST
-          value: "llamastack-postgres.${NAMESPACE}.svc.cluster.local"
-        - name: POSTGRES_PORT
-          value: "5432"
-        - name: POSTGRES_DB
-          value: "llamastack"
-        - name: POSTGRES_USER
-          value: "llamastack"
-        - name: POSTGRES_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: llamastack-postgres-secret
-              key: password
-        - name: FMS_ORCHESTRATOR_URL
-          value: "http://localhost"
+    name: rh-dev
   network:
+    port: 8321
     externalAccess:
       enabled: true
-  providers:
-    inference:
-      remote:
-        vllm:
-          # Remote LLM (direct vLLM InferenceService -- not MaaS)
-          - id: vllm
-            endpoint: "${VLLM_URL}"
-            maxTokens: 4096
-            apiToken:
-              name: ogx-secret
-              key: VLLM_API_TOKEN
-          # Remote embeddings (bge-m3 via vLLM)
-          - id: vllm-embedding
-            endpoint: "${VLLM_EMBEDDING_URL}"
-            maxTokens: 8192
-            apiToken:
-              name: ogx-secret
-              key: VLLM_EMBEDDING_API_TOKEN
-    vectorIo:
-      remote:
-        milvus:
-          - id: milvus
-            uri: "${MILVUS_ENDPOINT}"
-            consistencyLevel: Bounded
+  overrideConfig:
+    key: config.yaml
+    name: llama-stack-config
+  workload:
+    overrides:
+      command:
+      - /bin/sh
+      - -c
+      - ogx run /etc/ogx/config.yaml --insecure
+      env:
+      - name: VLLM_TLS_VERIFY
+        value: "false"
+      - name: FAISS_STORE_DIR
+        value: ~/.llama/faiss
+      - name: SENTENCE_TRANSFORMERS_HOME
+        value: /opt/app-root/.cache/huggingface/hub
+      - name: HF_HUB_OFFLINE
+        value: "1"
+      - name: TRANSFORMERS_OFFLINE
+        value: "1"
+      - name: HF_DATASETS_OFFLINE
+        value: "1"
+      - name: VLLM_MAX_TOKENS_1
+        value: "4096"
+      - name: VLLM_API_TOKEN_1
+        value: "unused"
+      - name: PGVECTOR_HOST
+        value: "genai-pgvector.${NAMESPACE}.svc.cluster.local"
+      - name: PGVECTOR_PORT
+        value: "5432"
+      - name: PGVECTOR_DB
+        value: vectordb
+      - name: PGVECTOR_USER
+        value: vectoruser
+      - name: PGVECTOR_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            key: password
+            name: genai-pgvector-credentials
+      - name: OGX_CONFIG_DIR
+        value: /opt/app-root/src/.ogx/distributions/rh/
+    replicas: 1
+    resources:
+      limits:
+        cpu: "2"
+        memory: 12Gi
+      requests:
+        cpu: 250m
+        memory: 500Mi

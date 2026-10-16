@@ -257,119 +257,74 @@ else
     print_info "Embedding model already present in $NAMESPACE"
 fi
 
-# --- Step 6: LlamaStack/OGX (auto-configured with direct vLLM + embedding endpoints) ---
+# --- Step 6: OGX Server (overrideConfig approach — bypasses operator config generation) ---
 if [ "$USE_OGX" = true ]; then
     print_step "Deploying OGX (replaces Llama Stack on RHOAI 3.5+)..."
-else
-    print_step "Deploying LlamaStack..."
-fi
 
-# Detect direct vLLM LLM endpoint (standard InferenceService, not MaaS)
-if detect_direct_llm_endpoint; then
-    print_info "Found direct vLLM LLM: $DIRECT_MODEL_NAME (ns: $DIRECT_MODEL_NS)"
-else
-    print_warning "No direct vLLM LLM endpoint found -- LlamaStack/OGX will need manual VLLM_URL configuration"
-fi
-
-# Detect embedding model in this namespace
-EMBEDDING_ISVC=""
-while IFS= read -r isvc_name; do
-    [ -z "$isvc_name" ] && continue
-    if echo "$isvc_name" | grep -qi -E 'bge|e5-|embed|nomic-embed'; then
-        EMBEDDING_ISVC="$isvc_name"
-        break
-    fi
-done < <(oc get inferenceservice -n "$NAMESPACE" --no-headers -o custom-columns='NAME:.metadata.name' 2>/dev/null || true)
-
-EMBED_SVC="" EMBED_PORT=""
-if [ -n "$EMBEDDING_ISVC" ]; then
-    EMBED_SVC=$(oc get svc -n "$NAMESPACE" -l "serving.kserve.io/inferenceservice=${EMBEDDING_ISVC}" \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-    EMBED_SVC="${EMBED_SVC:-${EMBEDDING_ISVC}-predictor}"
-    EMBED_PORT=$(oc get svc "$EMBED_SVC" -n "$NAMESPACE" \
-        -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo "80")
-    print_info "Found embedding model: $EMBEDDING_ISVC"
-else
-    print_warning "No embedding model found in $NAMESPACE -- deploy one (e.g. bge-m3) before running AutoRAG"
-fi
-
-# Set envsubst variables for LlamaStack manifest
-export INFERENCE_MODEL="${DIRECT_MODEL_NAME:-}"
-export VLLM_URL="${DIRECT_BASE_URL:-}"
-export VLLM_TLS_VERIFY="false"
-export VLLM_API_TOKEN="unused"
-export EMBEDDING_MODEL="${EMBEDDING_ISVC:-bge-m3}"
-export EMBEDDING_PROVIDER_MODEL_ID="${EMBEDDING_ISVC:-bge-m3}"
-if [ -n "$EMBEDDING_ISVC" ]; then
-    export VLLM_EMBEDDING_URL="http://${EMBED_SVC}.${NAMESPACE}.svc.cluster.local:${EMBED_PORT}/v1"
-else
-    export VLLM_EMBEDDING_URL=""
-fi
-export VLLM_EMBEDDING_API_TOKEN="unused"
-export VLLM_EMBEDDING_TLS_VERIFY="false"
-export VLLM_EMBEDDING_MAX_TOKENS="8192"
-export MILVUS_ENDPOINT
-export MILVUS_TOKEN=""
-
-if [ "$USE_OGX" = true ]; then
-    # Workaround for RHOAIENG-96724: OGX operator's OCI-label-fetch uses anonymous
-    # HTTP requests to registry.redhat.io, which returns HTTP 401. Supply the base
-    # config via a ConfigMap (spec.baseConfig) to bypass the failing OCI path.
-    # Also: secrets referenced by OGXServer need the ogx.io/watch label, or the
-    # operator's scoped cache won't see them ("Secret not found" even though it exists).
-    print_step "Applying OGX workaround (RHOAIENG-96724: supply base config via ConfigMap)..."
-    local _ogx_digest
-    _ogx_digest=$(oc get deployment -n redhat-ods-applications -l app.kubernetes.io/name=ogx-k8s-operator \
-        -o jsonpath='{.items[0].spec.template.spec.containers[0].env[?(@.name=="RELATED_IMAGE_ODH_OGX_CORE_IMAGE")].value}' 2>/dev/null)
-    
-    if [ -n "$_ogx_digest" ] && ! oc get configmap rh-ogx-base-config -n "$NAMESPACE" &>/dev/null; then
-        print_step "Extracting OGX base config from OCI image labels..."
-        local _pull_secret_file
-        _pull_secret_file=$(mktemp)
-        oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d > "$_pull_secret_file" 2>/dev/null
-        
-        local _config_yaml
-        _config_yaml=$(oc image info "$_ogx_digest" --registry-config="$_pull_secret_file" --filter-by-os=linux/amd64 -o json 2>/dev/null | \
-            python3 -c "
-import json, sys, base64
-d = json.load(sys.stdin)
-labels = d.get('config',{}).get('config',{}).get('Labels',{})
-val = labels.get('com.ogx.config.config.yaml','')
-try: print(base64.b64decode(val).decode())
-except: print(val)
-" 2>/dev/null)
-        rm -f "$_pull_secret_file"
-        
-        if [ -n "$_config_yaml" ]; then
-            oc create configmap rh-ogx-base-config \
-                --from-literal=config.yaml="$_config_yaml" \
-                -n "$NAMESPACE" --dry-run=client -o yaml | \
-                python3 -c "
-import yaml, sys
-d = yaml.safe_load(sys.stdin)
-d['metadata']['labels'] = {'ogx.io/watch': 'true'}
-yaml.dump(d, sys.stdout, default_flow_style=False)
-" | oc apply -f -
-            print_success "OGX base config ConfigMap created (bypasses OCI 401)"
-        else
-            print_warning "Could not extract OGX base config from image -- OGXServer may fail with HTTP 401"
-            print_info "See docs/reference/BUG-REPORT-OGX-REGISTRY-AUTH-401.md for manual workaround"
-        fi
-    elif oc get configmap rh-ogx-base-config -n "$NAMESPACE" &>/dev/null; then
-        print_success "OGX base config ConfigMap already exists [SKIP]"
-    fi
-
+    # Deploy pgvector (required by OGX for vector_io + responses persistence)
+    print_step "Deploying pgvector database for OGX..."
+    export PGVECTOR_PASSWORD="${PGVECTOR_PASSWORD:-$(openssl rand -hex 16)}"
     envsubst < "$SCRIPT_DIR/manifests/ogxserver.yaml" | oc apply -f -
-    
-    # Patch OGXServer to use the baseConfig ConfigMap (if created above)
-    if oc get configmap rh-ogx-base-config -n "$NAMESPACE" &>/dev/null; then
-        oc patch ogxserver autorag-ogx -n "$NAMESPACE" --type=merge \
-            -p '{"spec":{"baseConfig":{"name":"rh-ogx-base-config","key":"config.yaml"}}}' 2>/dev/null || true
+
+    # Wait for pgvector
+    oc rollout status deployment/genai-pgvector -n "$NAMESPACE" --timeout=120s 2>/dev/null || true
+
+    # Copy the working llama-stack-config from the Playground (ai-studio-demo)
+    # or any namespace that has a Ready OGXServer. This config has all the
+    # provider definitions (inference, vector_io, responses, tool_runtime)
+    # that the Python runtime needs, without the CRD schema gaps.
+    if ! oc get configmap llama-stack-config -n "$NAMESPACE" &>/dev/null; then
+        print_step "Copying OGX base config (llama-stack-config)..."
+        # Try to find a working config from another namespace
+        local _src_ns=""
+        for _ns in ai-studio-demo redhat-ods-applications; do
+            if oc get configmap llama-stack-config -n "$_ns" &>/dev/null; then
+                _src_ns="$_ns"
+                break
+            fi
+        done
+
+        if [ -n "$_src_ns" ]; then
+            oc get configmap llama-stack-config -n "$_src_ns" -o json \
+                | jq ".metadata.namespace = \"$NAMESPACE\" | del(.metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.managedFields, .metadata.ownerReferences)" \
+                | oc apply -f -
+            print_success "Copied llama-stack-config from $_src_ns"
+        else
+            # Fallback: extract from OCI image labels (RHOAIENG-96724 workaround)
+            print_step "Extracting OGX base config from OCI image labels..."
+            local _ogx_digest
+            _ogx_digest=$(oc get deployment -n redhat-ods-applications -l app.kubernetes.io/name=ogx-k8s-operator \
+                -o jsonpath='{.items[0].spec.template.spec.containers[0].env[?(@.name=="RELATED_IMAGE_ODH_OGX_CORE_IMAGE")].value}' 2>/dev/null)
+            if [ -n "$_ogx_digest" ]; then
+                local _pull_secret_file
+                _pull_secret_file=$(mktemp)
+                oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d > "$_pull_secret_file" 2>/dev/null
+                local _config_yaml
+                _config_yaml=$(oc image info --filter-by-os linux/amd64 -a "$_pull_secret_file" "$_ogx_digest" -o json 2>/dev/null \
+                    | jq -r '.config.config.Labels["com.ogx.config.config.yaml"]' 2>/dev/null)
+                rm -f "$_pull_secret_file"
+                if [ -n "$_config_yaml" ] && [ "$_config_yaml" != "null" ]; then
+                    oc create configmap llama-stack-config \
+                        --from-literal=config.yaml="$_config_yaml" \
+                        -n "$NAMESPACE" --dry-run=client -o yaml | oc apply -f -
+                    print_success "Extracted OGX config from OCI labels"
+                else
+                    print_warning "Could not extract OGX config -- OGXServer will fail"
+                fi
+            fi
+        fi
+    else
+        print_info "llama-stack-config already exists [SKIP]"
     fi
-    
+
+    # Apply OGXServer CR (uses overrideConfig, not baseConfig)
+    # The manifest references llama-stack-config via overrideConfig which
+    # completely bypasses the operator's config generation.
     print_info "OGX deploying (takes 1-2 minutes)..."
 
-    # Wait briefly for OGX pod to start (deployment/service named after the CR: autorag-ogx)
+    envsubst < "$SCRIPT_DIR/manifests/ogxserver.yaml" | oc apply -f -
+
+    # Wait for OGX pod to start
     sleep 5
     oc rollout status deployment/autorag-ogx -n "$NAMESPACE" --timeout=180s 2>/dev/null || \
         print_warning "OGX not ready yet -- check: oc get pods -l app.kubernetes.io/instance=autorag-ogx -n $NAMESPACE"
