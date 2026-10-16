@@ -297,7 +297,7 @@ fi
 export INFERENCE_MODEL="${DIRECT_MODEL_NAME:-}"
 export VLLM_URL="${DIRECT_BASE_URL:-}"
 export VLLM_TLS_VERIFY="false"
-export VLLM_API_TOKEN=""
+export VLLM_API_TOKEN="unused"
 export EMBEDDING_MODEL="${EMBEDDING_ISVC:-bge-m3}"
 export EMBEDDING_PROVIDER_MODEL_ID="${EMBEDDING_ISVC:-bge-m3}"
 if [ -n "$EMBEDDING_ISVC" ]; then
@@ -305,7 +305,7 @@ if [ -n "$EMBEDDING_ISVC" ]; then
 else
     export VLLM_EMBEDDING_URL=""
 fi
-export VLLM_EMBEDDING_API_TOKEN=""
+export VLLM_EMBEDDING_API_TOKEN="unused"
 export VLLM_EMBEDDING_TLS_VERIFY="false"
 export VLLM_EMBEDDING_MAX_TOKENS="8192"
 export MILVUS_ENDPOINT
