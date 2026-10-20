@@ -1,351 +1,213 @@
 #!/bin/bash
-
 ################################################################################
-# Setup MCP Servers for RHOAI GenAI Playground
+# Setup MCP Servers for RHOAI GenAI Playground / AI Asset Endpoints
 ################################################################################
-# This script configures MCP (Model Context Protocol) servers for use with
-# the GenAI Playground and AI Agents in RHOAI 3.0
+# Deploys MCP servers and registers them as MCPServer CRs so they appear in
+# the RHOAI Dashboard → AI Asset Endpoints → MCP Servers tab.
 #
-# Based on CAI Guide Section on MCP Servers
+# RHOAI 3.5+: Uses MCPServer CRDs (mcp.x-k8s.io/v1alpha1) managed by the
+#   MCP Lifecycle Operator. The operator provisions Deployments, Services,
+#   NetworkPolicies, and cluster-internal URLs automatically.
+#
+# Prerequisites created by this script in the target namespace:
+#   - openshift-mcp-server-config ConfigMap (config.toml for the server)
+#   - mcp-viewer ServiceAccount + cluster-reader ClusterRoleBinding
+#   - opendatahub.io/dashboard=true namespace label
+#
+# Usage:
+#   ./setup-mcp-servers.sh                  # Interactive (default ns: ai-tenants)
+#   ./setup-mcp-servers.sh -n my-project    # Specific namespace
+#   ./setup-mcp-servers.sh --non-interactive # Deploy OpenShift MCP with defaults
+#   ./setup-mcp-servers.sh --delete         # Remove MCP servers
 ################################################################################
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MANIFEST_DIR="$SCRIPT_DIR/../lib/manifests"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+MANIFEST_DIR="$ROOT_DIR/lib/manifests"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+source "$ROOT_DIR/lib/utils/colors.sh"
 
-print_header() {
-    echo -e "${BLUE}╔════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║ $1${NC}"
-    echo -e "${BLUE}╚════════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-}
+NAMESPACE="ai-tenants"
+DELETE_MODE=false
+NON_INTERACTIVE=false
+READ_ONLY=false
 
-print_step() { echo -e "${CYAN}▶ $1${NC}"; }
-print_success() { echo -e "${GREEN}✓ $1${NC}"; }
-print_error() { echo -e "${RED}✗ $1${NC}"; }
-print_warning() { echo -e "${YELLOW}⚠ $1${NC}"; }
-print_info() { echo -e "${BLUE}ℹ $1${NC}"; }
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -n|--namespace) NAMESPACE="$2"; shift 2 ;;
+        --delete) DELETE_MODE=true; shift ;;
+        --non-interactive) NON_INTERACTIVE=true; shift ;;
+        --read-only) READ_ONLY=true; shift ;;
+        -h|--help)
+            echo "Usage: $0 [-n namespace] [--non-interactive] [--read-only] [--delete]"
+            exit 0
+            ;;
+        *) shift ;;
+    esac
+done
 
-print_header "Setup MCP Servers for RHOAI GenAI Playground"
+print_header "Setup MCP Servers"
 
-# Check if logged in
 if ! oc whoami &>/dev/null; then
     print_error "Not logged in to OpenShift cluster"
     exit 1
 fi
 
-print_success "Connected to cluster: $(oc whoami --show-server)"
-echo ""
+if [ "$DELETE_MODE" = true ]; then
+    print_step "Removing MCP servers from $NAMESPACE..."
+    oc delete mcpserver --all -n "$NAMESPACE" --ignore-not-found 2>/dev/null
+    oc delete configmap openshift-mcp-server-config -n "$NAMESPACE" --ignore-not-found 2>/dev/null
+    oc delete sa mcp-viewer -n "$NAMESPACE" --ignore-not-found 2>/dev/null
+    print_success "MCP servers removed from $NAMESPACE"
+    exit 0
+fi
 
-# Check if RHOAI is installed
-if ! oc get namespace redhat-ods-applications &>/dev/null; then
-    print_error "RHOAI namespace not found"
-    print_info "Please install RHOAI first: ./rhoai-toolkit.sh"
+# Check MCP Lifecycle Operator is available
+if ! oc get crd mcpservers.mcp.x-k8s.io &>/dev/null; then
+    print_error "MCPServer CRD not found. Ensure mcplifecycleoperator is Managed in your DSC."
+    print_info "  oc patch dsc default-dsc --type=merge -p '{\"spec\":{\"components\":{\"mcplifecycleoperator\":{\"managementState\":\"Managed\"}}}}'"
     exit 1
 fi
+print_success "MCP Lifecycle Operator available"
 
-print_success "RHOAI namespace found"
-echo ""
+# Ensure namespace exists with dashboard label
+oc get ns "$NAMESPACE" &>/dev/null || oc create ns "$NAMESPACE"
+oc label ns "$NAMESPACE" opendatahub.io/dashboard=true --overwrite 2>/dev/null || true
 
-print_header "MCP Server Configuration"
+# Create prerequisites in the namespace
+print_step "Creating prerequisites in $NAMESPACE..."
 
-echo -e "${YELLOW}MCP (Model Context Protocol) servers enable AI agents to interact with external services.${NC}"
-echo ""
-echo "Available MCP servers:"
-echo "  1) GitHub MCP Server - Interact with GitHub repositories"
-echo "  2) Kubernetes/OpenShift MCP Server - Cluster operations, pods, logs, resources"
-echo "  3) Filesystem MCP Server - Access files and directories"
-echo "  4) Brave Search MCP Server - Web search capabilities"
-echo "  5) PostgreSQL MCP Server - Database queries"
-echo "  6) Sequential Thinking MCP Server - Multi-step reasoning"
-echo "  7) Custom MCP Server - Add your own"
-echo ""
+# ServiceAccount + RBAC (the MCP server needs cluster-reader to query resources)
+oc create sa mcp-viewer -n "$NAMESPACE" 2>/dev/null || true
+oc create clusterrolebinding "mcp-viewer-${NAMESPACE}" \
+    --clusterrole=cluster-reader \
+    --serviceaccount="${NAMESPACE}:mcp-viewer" 2>/dev/null || true
 
-read -p "Which MCP servers would you like to enable? (comma-separated, e.g., 1,2,3 or 'all'): " mcp_choice
+# Config file for the OpenShift MCP server
+READ_ONLY_STR="false"
+[ "$READ_ONLY" = true ] && READ_ONLY_STR="true"
+oc create configmap openshift-mcp-server-config \
+    --from-literal=config.toml="read_only = ${READ_ONLY_STR}" \
+    -n "$NAMESPACE" --dry-run=client -o yaml | oc apply -f - 2>/dev/null
 
-# Build the ConfigMap data
-MCP_DATA=""
+print_success "Prerequisites created"
 
-if [[ "$mcp_choice" == "all" ]] || [[ "$mcp_choice" =~ 1 ]]; then
-    echo ""
-    print_info "GitHub MCP Server Configuration"
-    print_warning "GitHub MCP requires authentication to access repositories and API."
-    echo ""
-    echo "To create a GitHub Personal Access Token:"
-    echo "  1. Go to: https://github.com/settings/tokens/new"
-    echo "  2. Give it a name (e.g., 'OpenShift AI MCP')"
-    echo "  3. Select scopes: 'repo' and 'read:org'"
-    echo "  4. Click 'Generate token' and copy it"
-    echo ""
-    read -p "Enter your GitHub Personal Access Token (or press Enter to skip): " github_token
-    
-    if [ -n "$github_token" ]; then
-        print_info "Adding GitHub MCP Server with authentication..."
-        MCP_DATA+='  GitHub-MCP-Server: |
-    {
-      "url": "https://api.githubcopilot.com/mcp",
-      "headers": {
-        "Authorization": "Bearer '"$github_token"'"
-      },
-      "description": "GitHub MCP server with authentication for repository access, code search, issues, and pull requests."
-    }
-'
-    else
-        print_warning "Skipping GitHub MCP Server (no token provided)"
-        print_info "You can add it later by re-running this script"
-    fi
-fi
+# Deploy OpenShift MCP Server via MCPServer CR
+deploy_openshift_mcp() {
+    local image="registry.redhat.io/openshift-mcp-tech-preview/openshift-mcp-server-rhel9:0.4"
 
-if [[ "$mcp_choice" == "all" ]] || [[ "$mcp_choice" =~ 2 ]]; then
-    echo ""
-    print_info "Kubernetes/OpenShift MCP Server (github.com/openshift/openshift-mcp-server)"
-    print_info "Native Go implementation -- no kubectl dependency, supports CRUD, Helm, Tekton, metrics"
-    echo ""
+    print_step "Deploying OpenShift MCP Server..."
 
-    K8S_MCP_URL="http://kubernetes-mcp-server.mcp-servers.svc.cluster.local:8080"
+    cat <<EOF | oc apply -f -
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: oc-mcp-server
+  namespace: ${NAMESPACE}
+  labels:
+    opendatahub.io/dashboard: "true"
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ${image}
+  config:
+    port: 8080
+    path: /mcp
+    arguments:
+      - "--config"
+      - "/etc/mcp-config/config.toml"
+      - "--port"
+      - "8080"
+      - "--toolsets"
+      - "core,config,openshift,observability"
+    storage:
+      - name: config
+        mountPath: /etc/mcp-config
+        volumeSource:
+          configMap:
+            name: openshift-mcp-server-config
+EOF
 
-    read -p "Deploy Kubernetes MCP Server to cluster? (Y/n): " deploy_k8s
-    deploy_k8s="${deploy_k8s:-Y}"
-
-    if [[ "$deploy_k8s" =~ ^[Yy]$ ]]; then
-        oc create namespace mcp-servers 2>/dev/null || true
-
-        if command -v helm &>/dev/null; then
-            print_info "Deploying Kubernetes MCP Server via Helm..."
-            helm upgrade --install kubernetes-mcp-server \
-                oci://ghcr.io/containers/charts/kubernetes-mcp-server \
-                -n mcp-servers \
-                --set config.port=8080 \
-                --set extraArgs='{--read-only}' 2>/dev/null && \
-                print_success "Kubernetes MCP Server deployed via Helm" || \
-                print_warning "Helm install failed -- deploying manually"
+    # Wait for pod
+    print_info "Waiting for MCP server pod..."
+    local elapsed=0
+    while [ $elapsed -lt 90 ]; do
+        if oc get pods -n "$NAMESPACE" -l app.kubernetes.io/name=oc-mcp-server --no-headers 2>/dev/null | grep -q Running; then
+            print_success "OpenShift MCP Server running"
+            break
         fi
+        sleep 10
+        elapsed=$((elapsed + 10))
+    done
 
-        if ! oc get deployment kubernetes-mcp-server -n mcp-servers &>/dev/null 2>&1; then
-            print_info "Deploying Kubernetes MCP Server natively..."
-            oc apply -f "$MANIFEST_DIR/mcp-servers/kubernetes-mcp-server-standalone.yaml"
-            print_success "Kubernetes MCP Server deployed"
-        fi
-    else
-        read -p "Enter Kubernetes MCP Server URL (or press Enter for default): " k8s_url_input
-        K8S_MCP_URL="${k8s_url_input:-$K8S_MCP_URL}"
+    if [ $elapsed -ge 90 ]; then
+        print_warning "MCP server not ready yet — check: oc get mcpserver -n $NAMESPACE"
     fi
+}
 
-    print_info "Adding Kubernetes MCP Server to ConfigMap..."
-    MCP_DATA+='  Kubernetes-MCP-Server: |
-    {
-      "url": "'"$K8S_MCP_URL"'/mcp",
-      "description": "Kubernetes and OpenShift cluster operations. List, get, create, update, delete any resource. Pod logs, exec, events, Helm, Tekton pipelines."
-    }
-'
-fi
-
-if [[ "$mcp_choice" == "all" ]] || [[ "$mcp_choice" =~ 3 ]]; then
-    echo ""
-    read -p "Deploy Filesystem MCP Server to cluster? (y/N): " deploy_fs
-    
-    local fs_url="http://filesystem-mcp-server.mcp-servers.svc.cluster.local:8080"
-    
-    if [[ "$deploy_fs" =~ ^[Yy]$ ]]; then
-        print_info "Deploying Filesystem MCP Server..."
-        
-        # Create namespace if it doesn't exist
-        oc create namespace mcp-servers 2>/dev/null || true
-        
-        # Deploy filesystem MCP server (placeholder - would need actual deployment)
-        oc apply -f "$MANIFEST_DIR/mcp-servers/filesystem-mcp-server.yaml"
-
-        print_success "Filesystem MCP Server deployed"
-    else
-        read -p "Enter Filesystem MCP Server URL (or press Enter for default): " fs_url_input
-        fs_url="${fs_url_input:-$fs_url}"
-    fi
-    
-    print_info "Adding Filesystem MCP Server..."
-    MCP_DATA+='  Filesystem-MCP-Server: |
-    {
-      "url": "'"$fs_url"'",
-      "description": "Access and manipulate files in a secure filesystem. Read, write, and manage files and directories."
-    }
-'
-fi
-
-if [[ "$mcp_choice" == "all" ]] || [[ "$mcp_choice" =~ 4 ]]; then
-    echo ""
-    read -p "Enter Brave Search API Key (or press Enter to skip): " brave_key
-    
-    local brave_url="http://brave-search-mcp-server.mcp-servers.svc.cluster.local:8080"
-    
-    if [ -n "$brave_key" ]; then
-        print_info "Deploying Brave Search MCP Server with API key..."
-        
-        oc create namespace mcp-servers 2>/dev/null || true
-        
-        # Create secret for API key
-        oc create secret generic brave-search-api-key \
-            --from-literal=api-key="$brave_key" \
-            -n mcp-servers \
-            --dry-run=client -o yaml | oc apply -f -
-        
-        print_success "Brave Search API key configured"
-    fi
-    
-    print_info "Adding Brave Search MCP Server..."
-    MCP_DATA+='  Brave-Search-MCP-Server: |
-    {
-      "url": "'"$brave_url"'",
-      "description": "Search the web using Brave Search API. Get real-time information from the internet."
-    }
-'
-fi
-
-if [[ "$mcp_choice" =~ 5 ]]; then
-    echo ""
-    print_info "PostgreSQL MCP Server Configuration"
-    read -p "Enter PostgreSQL connection string (e.g., postgres://user:pass@host:5432/db): " pg_conn
-    read -p "Enter PostgreSQL MCP Server URL (or press Enter for default): " pg_url
-    pg_url="${pg_url:-http://postgresql-mcp-server.mcp-servers.svc.cluster.local:8080}"
-    
-    print_info "Adding PostgreSQL MCP Server..."
-    MCP_DATA+='  PostgreSQL-MCP-Server: |
-    {
-      "url": "'"$pg_url"'",
-      "description": "Execute SQL queries against PostgreSQL databases. Retrieve and analyze data."
-    }
-'
-fi
-
-if [[ "$mcp_choice" =~ 6 ]]; then
-    echo ""
-    local seq_url="http://sequential-thinking-mcp-server.mcp-servers.svc.cluster.local:8080"
-    read -p "Enter Sequential Thinking MCP Server URL (or press Enter for default): " seq_url_input
-    seq_url="${seq_url_input:-$seq_url}"
-    
-    print_info "Adding Sequential Thinking MCP Server..."
-    MCP_DATA+='  Sequential-Thinking-MCP-Server: |
-    {
-      "url": "'"$seq_url"'",
-      "description": "Enable multi-step reasoning and chain-of-thought problem solving."
-    }
-'
-fi
-
-if [[ "$mcp_choice" =~ 7 ]]; then
-    echo ""
-    print_info "Custom MCP Server Configuration"
-    read -p "Enter MCP server name: " custom_name
-    read -p "Enter MCP server URL: " custom_url
-    read -p "Enter MCP server description: " custom_desc
-    
-    print_info "Adding Custom MCP Server..."
-    MCP_DATA+='  '"$custom_name"': |
-    {
-      "url": "'"$custom_url"'",
-      "description": "'"$custom_desc"'"
-    }
-'
-fi
-
-if [ -z "$MCP_DATA" ]; then
-    print_error "No MCP servers selected"
-    exit 1
-fi
-
-echo ""
-print_header "Creating MCP Server ConfigMap"
-
-# Create the ConfigMap
-export MCP_DATA
-envsubst '${MCP_DATA}' < "$MANIFEST_DIR/mcp-servers/ai-asset-configmap-bulk.yaml.tmpl" | oc apply -f -
-
-if [ $? -eq 0 ]; then
-    echo ""
-    print_success "✅ MCP Server ConfigMap created successfully!"
-    echo ""
-    
-    print_header "Restarting Playground Pods"
-    
-    print_info "Restarting playground pods to load new MCP server configuration..."
-    
-    # Find all namespaces with playground pods
-    playground_namespaces=$(oc get pods -A -l app=lsd-genai-playground -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' | sort -u)
-    
-    if [ -n "$playground_namespaces" ]; then
-        for ns in $playground_namespaces; do
-            print_step "Restarting playground in namespace: $ns"
-            oc delete pod -l app=lsd-genai-playground -n "$ns" --ignore-not-found=true
-        done
-        
-        echo ""
-        print_info "Waiting for playground pods to restart (30 seconds)..."
-        sleep 30
-        
-        print_success "Playground pods restarted"
-    else
-        print_warning "No playground pods found. MCP servers will be available when you add a model to playground."
-    fi
-    
-    echo ""
-    
-    print_header "Next Steps"
-    
-    print_info "1. Access the GenAI Playground:"
-    DASHBOARD_URL=$(oc get route rhods-dashboard -n redhat-ods-applications -o jsonpath='{.spec.host}' 2>/dev/null)
-    if [ -n "$DASHBOARD_URL" ]; then
-        echo "   https://$DASHBOARD_URL"
-    else
-        echo "   oc get route rhods-dashboard -n redhat-ods-applications"
-    fi
-    echo ""
-    
-    print_info "2. Navigate to: GenAI Studio → Playground"
-    echo ""
-    
-    print_info "3. Look for the 🔌 Tools or MCP section"
-    echo ""
-    
-    print_info "4. Click the 🔒 (lock icon) next to each MCP server to connect"
-    echo "   (Required even if no authentication is needed)"
-    echo ""
-    
-    print_info "5. Start using MCP servers in your prompts!"
-    echo "   Example: 'Use the GitHub MCP server to search for Kubernetes projects'"
-    echo ""
-    
-    print_header "View MCP Server Configuration"
-    echo "To view the configured MCP servers:"
-    echo "  oc get configmap gen-ai-aa-mcp-servers -n redhat-ods-applications -o yaml"
-    echo ""
-    
-    print_header "Add More MCP Servers"
-    echo "You can add more MCP servers by:"
-    echo "  1. Deploying custom MCP servers"
-    echo "     See: https://github.com/opendatahub-io/agents/tree/main/examples"
-    echo "  2. Re-running this script to update the ConfigMap"
-    echo "  3. Manually editing the ConfigMap:"
-    echo "     oc edit configmap gen-ai-aa-mcp-servers -n redhat-ods-applications"
-    echo ""
-    
-    print_header "Documentation"
-    echo "For more information, see:"
-    echo "  - docs/guides/MCP-SERVERS.md"
-    echo "  - docs/guides/GENAI-PLAYGROUND-INTEGRATION.md"
-    echo ""
-    
+if [ "$NON_INTERACTIVE" = true ]; then
+    deploy_openshift_mcp
 else
-    print_error "Failed to create MCP Server ConfigMap"
-    exit 1
+    echo ""
+    echo "Available MCP servers:"
+    echo "  1) OpenShift Cluster MCP Server (core, config, openshift, observability toolsets)"
+    echo "  2) Custom MCP Server (bring your own image)"
+    echo ""
+    read -p "Which MCP server to deploy? (1/2, default: 1): " choice
+    choice="${choice:-1}"
+
+    case "$choice" in
+        1)
+            deploy_openshift_mcp
+            ;;
+        2)
+            read -p "Enter container image: " custom_image
+            read -p "Enter server name: " custom_name
+            read -p "Enter port (default 8080): " custom_port
+            custom_port="${custom_port:-8080}"
+
+            cat <<EOF | oc apply -f -
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: ${custom_name}
+  namespace: ${NAMESPACE}
+  labels:
+    opendatahub.io/dashboard: "true"
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ${custom_image}
+  config:
+    port: ${custom_port}
+EOF
+            print_success "Custom MCP Server '${custom_name}' created"
+            ;;
+        *)
+            print_error "Invalid choice"
+            exit 1
+            ;;
+    esac
 fi
 
 echo ""
-print_success "✅ MCP Server setup complete!"
+print_success "MCP Server setup complete"
 echo ""
-
+echo "  MCPServer CR:"
+oc get mcpserver -n "$NAMESPACE" 2>/dev/null | sed 's/^/    /'
+echo ""
+echo "  View in RHOAI Dashboard:"
+echo "    1. Go to AI Hub → AI Asset Endpoints"
+echo "    2. Select project: $NAMESPACE"
+echo "    3. Click 'MCP Servers' tab"
+echo ""
+echo "  Use in Playground:"
+echo "    1. Go to Gen AI Studio → Playground"
+echo "    2. Select project: $NAMESPACE"
+echo "    3. Click 'MCP' tab in Settings panel"
+echo "    4. Enable the MCP server"
+echo ""
