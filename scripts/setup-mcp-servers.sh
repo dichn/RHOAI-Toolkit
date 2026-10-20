@@ -146,6 +146,27 @@ EOF
     if [ $elapsed -ge 90 ]; then
         print_warning "MCP server not ready yet — check: oc get mcpserver -n $NAMESPACE"
     fi
+
+    # Register in the dashboard's gen-ai-aa-mcp-servers ConfigMap.
+    # The AI Asset Endpoints → MCP Servers tab reads from this ConfigMap
+    # (NOT from MCPServer CRs). Both are needed: CR for the operator to
+    # deploy the pod, ConfigMap for the dashboard to list it.
+    local mcp_url="http://oc-mcp-server.${NAMESPACE}.svc.cluster.local:8080/mcp"
+    print_step "Registering in dashboard ConfigMap (gen-ai-aa-mcp-servers)..."
+    local existing
+    existing=$(oc get configmap gen-ai-aa-mcp-servers -n redhat-ods-applications -o json 2>/dev/null || echo '{"data":{}}')
+    echo "$existing" | python3 -c "
+import json, sys
+cm = json.load(sys.stdin)
+if 'data' not in cm:
+    cm = {'apiVersion':'v1','kind':'ConfigMap','metadata':{'name':'gen-ai-aa-mcp-servers','namespace':'redhat-ods-applications'},'data':{}}
+cm['data']['OpenShift-MCP-Server'] = json.dumps({
+    'url': '${mcp_url}',
+    'description': 'OpenShift cluster operations — list, get, create, update, delete any resource. Pod logs, exec, events, Helm, observability.'
+}, indent=2)
+json.dump(cm, sys.stdout)
+" | oc apply -f - 2>/dev/null
+    print_success "Registered in AI Asset Endpoints"
 }
 
 if [ "$NON_INTERACTIVE" = true ]; then
